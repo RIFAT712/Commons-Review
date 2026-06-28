@@ -269,10 +269,15 @@ def callback():
         token = wikimedia.fetch_token(
             TOKEN_URL, client_secret=CLIENT_SECRET, authorization_response=request.url)
         session['oauth_token'] = token
+    except Exception as e:
+        return f"OAuth Token Exchange Failed: {e}"
 
+    try:
         # Fetch user info
         resp = wikimedia.get(PROFILE_URL, headers={'User-Agent': USER_AGENT})
-        resp.raise_for_status()
+        if not resp.ok:
+            return (f"OAuth Profile Fetch Failed: {resp.status_code} {resp.reason}<br>"
+                    f"Response body: <pre>{resp.text}</pre>")
         profile = resp.json()
         session['username'] = profile.get('username')
         return redirect(url_for('auditor.admin'))

@@ -510,19 +510,34 @@ def manage_event_users(event_id):
 
     if request.method == 'POST':
         action = request.form.get('action')
-        username = request.form.get('username', '').strip()
-        if action == 'add_user' and username:
-            if username not in details['tracked_users']:
-                details['tracked_users'].append(username)
+        input_usernames = request.form.get('username', '').strip()
+        
+        if action == 'add_user' and input_usernames:
+            usernames = [u.strip() for u in input_usernames.split(',') if u.strip()]
+            added, already_tracked = [], []
+            for u in usernames:
+                if u not in details['tracked_users']:
+                    details['tracked_users'].append(u)
+                    added.append(u)
+                else:
+                    already_tracked.append(u)
+            if added:
                 save_events_config(config)
-                flash(f"Added '{username}' to tracked users.", "success")
-            else:
-                flash(f"'{username}' is already tracked.", "error")
-        elif action == 'remove_user' and username:
-            if username in details['tracked_users']:
-                details['tracked_users'].remove(username)
+                flash(f"Added {len(added)} user(s): {', '.join(added)}", "success")
+            if already_tracked:
+                flash(f"Already tracked: {', '.join(already_tracked)}", "error")
+                
+        elif action == 'remove_user' and input_usernames:
+            usernames = [u.strip() for u in input_usernames.split(',') if u.strip()]
+            removed = []
+            for u in usernames:
+                if u in details['tracked_users']:
+                    details['tracked_users'].remove(u)
+                    removed.append(u)
+            if removed:
                 save_events_config(config)
-                flash(f"Removed '{username}' from tracked users.", "success")
+                flash(f"Removed {len(removed)} user(s): {', '.join(removed)}", "success")
+                
         return redirect(url_for('auditor.manage_event_users', event_id=event_id))
 
     return render_template_string(
@@ -919,7 +934,7 @@ MANAGE_USERS_TEMPLATE = """
         <form method="POST" class="form-group" autocomplete="off" onsubmit="return validateUser()">
             <input type="hidden" name="action" value="add_user">
             <div class="input-wrap">
-                <input type="text" name="username" id="usernameInput" placeholder="Type a Wikimedia username…" required>
+                <input type="text" name="username" id="usernameInput" placeholder="Type Wikimedia usernames (comma-separated)…" required>
                 <div id="suggestions"></div>
             </div>
             <button type="submit" class="btn btn-add">Add User</button>

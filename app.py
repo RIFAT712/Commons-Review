@@ -273,16 +273,24 @@ def callback():
         return f"OAuth Token Exchange Failed: {e}"
 
     try:
-        # Fetch user info
-        resp = wikimedia.get(PROFILE_URL, headers={'User-Agent': USER_AGENT})
+        # Fetch username via MediaWiki API (works without identity grant)
+        resp = wikimedia.get(
+            API_URL,
+            params={'action': 'query', 'meta': 'userinfo', 'format': 'json'},
+            headers={'User-Agent': USER_AGENT}
+        )
         if not resp.ok:
-            return (f"OAuth Profile Fetch Failed: {resp.status_code} {resp.reason}<br>"
+            return (f"OAuth API Failed: {resp.status_code} {resp.reason}<br>"
                     f"Response body: <pre>{resp.text}</pre>")
-        profile = resp.json()
-        session['username'] = profile.get('username')
+        data = resp.json()
+        username = data.get('query', {}).get('userinfo', {}).get('name')
+        if not username:
+            return f"Could not retrieve username from API response: <pre>{resp.text}</pre>"
+        session['username'] = username
         return redirect(url_for('auditor.admin'))
     except Exception as e:
         return f"OAuth Authentication Failed: {e}"
+
 
 
 @auditor_bp.route('/logout')

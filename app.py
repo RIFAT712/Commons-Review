@@ -42,7 +42,7 @@ META_API_URL = "https://meta.wikimedia.org/w/api.php"
 USER_AGENT = "WLEAuditor/1.0 (ztools on Toolforge)"
 HOME_DIR = os.environ.get("HOME", ".")
 EVENTS_FILE = os.path.join(HOME_DIR, "events.json")
-JSON_FILE = os.path.join(HOME_DIR, "removal_audit_log.json")
+LEGACY_JSON_FILE = os.path.join(HOME_DIR, "removal_audit_log.json")  # old single-file (migration source)
 LOG_FILE = os.path.join(HOME_DIR, "app.log")
 
 # The single owner account — only this user can manage roles
@@ -63,77 +63,96 @@ logger.info("=== Application starting up ===")
 lock = threading.Lock()
 
 
-def get_events_config():
-    if not os.path.exists(EVENTS_FILE):
-        default_config = {
-            "ongoing": [],
-            "archived": [],
-            "event_details": {},   # category -> {tracked_users: [], ...}
-            "allowed_managers": [] # users allowed to create/edit events
-        }
-        with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(default_config, f, indent=4)
-        return default_config
-    with open(EVENTS_FILE, 'r', encoding='utf-8') as f:
-        config = json.load(f)
-    # Backwards compatibility
-    if "event_details" not in config:
-        config["event_details"] = {}
-    if "allowed_managers" not in config:
-        config["allowed_managers"] = []
-    return config
+def get_event_file(category):
+    """Return the per-event JSON file path for a given category."""
+    return os.path.join(HOME_DIR, f"event_{get_category_id(category)}.json")
 
 
-def save_events_config(config):
-    with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4)
+def load_event_data(category):
+    """Load events for a single category from its own file."""
+    path = get_event_file(category)
+    if not os.path.exists(path):
+        return []
+    with open(path, 'r', encoding='utf-8') as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
+
+
+def save_event_data(category, cat_events):
+    """Write events for a single category to its own file."""
+    path = get_event_file(category)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(cat_events, f, indent=4, ensure_ascii=False)
 
 
 def get_existing_data():
-    events = []
-    seen_events = set()
-    if os.path.exists(JSON_FILE):
-        with open(JSON_FILE, mode='r', encoding='utf-8') as f:
-            try:
-                events = json.load(f)
-            except json.JSONDecodeError:
-                events = []
-        for row in events:
-            if "deleted" in row:
-                del row["deleted"]
-            # Backwards compatibility for events before we added 'category' field
-            if "category" not in row:
-                row["category"] = "Category:Unreviewed images from Wiki Loves Earth 2026 in Bangladesh"
+    """Load ALL events from all per-event files. Also migrates legacy single file."""
+    all_events = []
+    seen = set()
+    config = get_events_config()
+    all_categories = config.get('ongoing', []) + config.get('archived', [])
 
-            seen_events.add((row.get('timestamp'), row.get('file_title')))
-    return events, seen_events
+    # --- Migration: split old removal_audit_log.json into per-event files ---
+    if os.path.exists(LEGACY_JSON_FILE):
+        logger.info("[migration] Found legacy removal_audit_log.json — migrating to per-event files...")
+        try:
+            with open(LEGACY_JSON_FILE, 'r', encoding='utf-8') as f:
+                legacy = json.load(f)
+            by_cat = defaultdict(list)
+            for row in legacy:
+                if 'deleted' in row:
+                    del row['deleted']
+                if 'category' not in row:
+                    row['category'] = all_categories[0] if all_categories else 'Unknown'
+                by_cat[row['category']].append(row)
+            for cat, rows in by_cat.items():
+                existing = load_event_data(cat)
+                existing_keys = {(r.get('timestamp'), r.get('file_title')) for r in existing}
+                new_rows = [r for r in rows if (r.get('timestamp'), r.get('file_title')) not in existing_keys]
+                save_event_data(cat, existing + new_rows)
+                logger.info(f"[migration] Wrote {len(existing + new_rows)} rows to event_{get_category_id(cat)}.json")
+            os.rename(LEGACY_JSON_FILE, LEGACY_JSON_FILE + ".migrated")
+            logger.info("[migration] Done. Renamed legacy file to removal_audit_log.json.migrated")
+        except Exception as e:
+            logger.error(f"[migration] Failed: {e}")
+    # -------------------------------------------------------------------------
+
+    for category in all_categories:
+        cat_events = load_event_data(category)
+        for row in cat_events:
+            key = (row.get('timestamp'), row.get('file_title'))
+            if key not in seen:
+                seen.add(key)
+                all_events.append(row)
+
+    return all_events, seen
 
 
 events, seen_events = get_existing_data()
 
 
-def save_events():
-    with open(JSON_FILE, "w", encoding="utf-8") as f:
-        json.dump(events, f, indent=4, ensure_ascii=False)
+def save_category_events(category):
+    """Save only the in-memory events that belong to `category` to its file."""
+    cat_events = [e for e in events if e.get('category') == category]
+    save_event_data(category, cat_events)
 
 
-def get_leaderboard(category=None):
-    """Returns leaderboard filtered by tracked_users if set for this event.
-    Always reads from disk to stay consistent across restarts."""
+def get_leaderboard(category):
+    """Reads fresh from the per-event file — always up to date."""
     config = get_events_config()
     details = config.get("event_details", {}).get(category, {})
     tracked_users = details.get("tracked_users", [])
 
-    # Always read fresh from disk so we never serve stale data
-    fresh_events, _ = get_existing_data()
+    fresh_events = load_event_data(category)
 
     lb = defaultdict(set)
     for ev in fresh_events:
-        if category is None or ev.get("category") == category:
-            user = ev["user"]
-            if tracked_users and user not in tracked_users:
-                continue
-            lb[user].add(ev["file_title"])
+        user = ev["user"]
+        if tracked_users and user not in tracked_users:
+            continue
+        lb[user].add(ev["file_title"])
     counts = {u: len(fs) for u, fs in lb.items()}
     sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
     return [(i+1, u, c) for i, (u, c) in enumerate(sorted_counts)]
@@ -144,6 +163,7 @@ def catchup_missed_events():
     config = get_events_config()
     with requests.Session() as session_req:
         for category in config["ongoing"]:
+            cat_new = 0
             rccontinue = None
             while True:
                 params = {
@@ -159,8 +179,7 @@ def catchup_missed_events():
                     params["rccontinue"] = rccontinue
 
                 try:
-                    response = session_req.get(API_URL, params=params, headers={
-                                               "User-Agent": USER_AGENT})
+                    response = session_req.get(API_URL, params=params, headers={"User-Agent": USER_AGENT})
                     response.raise_for_status()
                     data = response.json()
                     if "query" in data and "recentchanges" in data["query"]:
@@ -170,19 +189,20 @@ def catchup_missed_events():
                                 timestamp = rc.get("timestamp")
                                 user = rc.get("user", "Unknown")
                                 match = re.search(r'\[\[(.*?)\]\]', comment)
-                                file_name = match.group(
-                                    1) if match else "Unknown"
+                                file_name = match.group(1) if match else "Unknown"
 
                                 with lock:
                                     if (timestamp, file_name) not in seen_events:
-                                        events.append({
+                                        row = {
                                             "timestamp": timestamp,
                                             "user": user,
                                             "file_title": file_name,
                                             "category": category,
                                             "full_comment": comment
-                                        })
+                                        }
+                                        events.append(row)
                                         seen_events.add((timestamp, file_name))
+                                        cat_new += 1
                                         new_rows += 1
 
                     if "continue" in data and "rccontinue" in data["continue"]:
@@ -190,12 +210,14 @@ def catchup_missed_events():
                     else:
                         break
                 except Exception as e:
-                    print(f"Error during catch-up for {category}: {e}")
+                    logger.error(f"[catchup] Error for '{category}': {e}")
                     break
 
-    if new_rows > 0:
-        with lock:
-            save_events()
+            if cat_new > 0:
+                with lock:
+                    save_category_events(category)
+                logger.info(f"[catchup] Saved {cat_new} new rows to event_{get_category_id(category)}.json")
+
     return new_rows
 
 
@@ -611,6 +633,7 @@ INDEX_TEMPLATE = """
 <head>
     <title>Global Removal Leaderboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="10">
     <style>
         body { font-family: 'Segoe UI', Tahoma, sans-serif; margin: 40px; background: #f4f4f9; color: #333; }
         .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }

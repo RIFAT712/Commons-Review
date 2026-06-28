@@ -104,24 +104,25 @@ def save_events():
 
 
 def get_leaderboard(category=None):
-    """Returns leaderboard filtered by tracked_users if set for this event."""
+    """Returns leaderboard filtered by tracked_users if set for this event.
+    Always reads from disk to stay consistent across restarts."""
     config = get_events_config()
     details = config.get("event_details", {}).get(category, {})
     tracked_users = details.get("tracked_users", [])
 
-    with lock:
-        lb = defaultdict(set)
-        for ev in events:
-            if category is None or ev.get("category") == category:
-                user = ev["user"]
-                # If tracked_users list is set, only include those users
-                if tracked_users and user not in tracked_users:
-                    continue
-                lb[user].add(ev["file_title"])
-        counts = {u: len(fs) for u, fs in lb.items()}
-        sorted_counts = sorted(
-            counts.items(), key=lambda x: x[1], reverse=True)
-        return [(i+1, u, c) for i, (u, c) in enumerate(sorted_counts)]
+    # Always read fresh from disk so we never serve stale data
+    fresh_events, _ = get_existing_data()
+
+    lb = defaultdict(set)
+    for ev in fresh_events:
+        if category is None or ev.get("category") == category:
+            user = ev["user"]
+            if tracked_users and user not in tracked_users:
+                continue
+            lb[user].add(ev["file_title"])
+    counts = {u: len(fs) for u, fs in lb.items()}
+    sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    return [(i+1, u, c) for i, (u, c) in enumerate(sorted_counts)]
 
 
 def catchup_missed_events():
@@ -185,49 +186,65 @@ def catchup_missed_events():
 
 
 def listen_to_stream():
+    """Connects to the Wikimedia EventStream and writes new removals to disk."""
     url = 'https://stream.wikimedia.org/v2/stream/recentchange'
+    retry_delay = 5
     while True:
         try:
-            with requests.get(url, stream=True, headers={'User-Agent': USER_AGENT, 'Accept': 'text/event-stream'}, timeout=120) as response:
+            print(f"[stream] Connecting to EventStream...", flush=True)
+            with requests.get(
+                url, stream=True,
+                headers={'User-Agent': USER_AGENT, 'Accept': 'text/event-stream'},
+                timeout=60
+            ) as response:
                 response.raise_for_status()
+                retry_delay = 5  # reset on successful connect
+                print(f"[stream] Connected. Listening...", flush=True)
                 for line in response.iter_lines():
                     if line:
                         decoded_line = line.decode('utf-8')
-                        if decoded_line.startswith('data: '):
-                            try:
-                                data = json.loads(decoded_line[6:])
-                                if data.get('wiki') == 'commonswiki' and data.get('type') == 'categorize':
-                                    title = data.get('title')
-                                    current_categories = get_events_config()[
-                                        "ongoing"]
-                                    if title in current_categories:
-                                        comment = data.get('comment', '')
-                                        if "removed" in comment.lower():
-                                            user = data.get('user', 'Unknown')
-                                            timestamp = data.get('meta', {}).get(
-                                                'dt', time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-                                            file_name = "Unknown"
-                                            match = re.search(
-                                                r'\[\[(.*?)\]\]', comment)
-                                            if match:
-                                                file_name = match.group(1)
+                        if not decoded_line.startswith('data: '):
+                            continue
+                        try:
+                            data = json.loads(decoded_line[6:])
+                        except json.JSONDecodeError:
+                            continue
 
-                                            with lock:
-                                                key = (timestamp, file_name)
-                                                if key not in seen_events:
-                                                    events.append({
-                                                        "timestamp": timestamp,
-                                                        "user": user,
-                                                        "file_title": file_name,
-                                                        "category": title,
-                                                        "full_comment": comment
-                                                    })
-                                                    seen_events.add(key)
-                                                    save_events()
-                            except json.JSONDecodeError:
-                                pass
+                        if data.get('wiki') != 'commonswiki' or data.get('type') != 'categorize':
+                            continue
+
+                        title = data.get('title', '')
+                        current_categories = get_events_config().get("ongoing", [])
+                        if title not in current_categories:
+                            continue
+
+                        comment = data.get('comment', '')
+                        if 'removed' not in comment.lower():
+                            continue
+
+                        user = data.get('user', 'Unknown')
+                        timestamp = data.get('meta', {}).get(
+                            'dt', time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                        match = re.search(r'\[\[(.*?)\]\]', comment)
+                        file_name = match.group(1) if match else 'Unknown'
+
+                        with lock:
+                            key = (timestamp, file_name)
+                            if key not in seen_events:
+                                events.append({
+                                    "timestamp": timestamp,
+                                    "user": user,
+                                    "file_title": file_name,
+                                    "category": title,
+                                    "full_comment": comment
+                                })
+                                seen_events.add(key)
+                                save_events()
+                                print(f"[stream] Saved: {user} removed {file_name} from {title}", flush=True)
         except Exception as e:
-            time.sleep(5)
+            print(f"[stream] Error: {e}. Reconnecting in {retry_delay}s...", flush=True)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)  # exponential backoff, max 60s
 
 
 stream_thread = threading.Thread(target=listen_to_stream, daemon=True)

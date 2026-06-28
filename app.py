@@ -37,8 +37,9 @@ PROFILE_URL = 'https://meta.wikimedia.org/w/rest.php/oauth2/resource/profile'
 # --- CONFIGURATION ---
 API_URL = "https://commons.wikimedia.org/w/api.php"
 USER_AGENT = "WLEAuditor/1.0 (ztools on Toolforge)"
-EVENTS_FILE = "events.json"
-JSON_FILE = "removal_audit_log.json"
+HOME_DIR = os.environ.get("HOME", ".")
+EVENTS_FILE = os.path.join(HOME_DIR, "events.json")
+JSON_FILE = os.path.join(HOME_DIR, "removal_audit_log.json")
 # ---------------------
 
 lock = threading.Lock()

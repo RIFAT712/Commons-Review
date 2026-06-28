@@ -63,6 +63,31 @@ logger.info("=== Application starting up ===")
 lock = threading.Lock()
 
 
+def get_events_config():
+    if not os.path.exists(EVENTS_FILE):
+        default_config = {
+            "ongoing": [],
+            "archived": [],
+            "event_details": {},
+            "allowed_managers": []
+        }
+        with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(default_config, f, indent=4)
+        return default_config
+    with open(EVENTS_FILE, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    if "event_details" not in config:
+        config["event_details"] = {}
+    if "allowed_managers" not in config:
+        config["allowed_managers"] = []
+    return config
+
+
+def save_events_config(config):
+    with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=4)
+
+
 def get_event_file(category):
     """Return the per-event JSON file path for a given category."""
     return os.path.join(HOME_DIR, f"event_{get_category_id(category)}.json")

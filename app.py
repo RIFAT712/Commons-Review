@@ -271,7 +271,7 @@ def callback():
         session['oauth_token'] = token
 
         # Fetch user info
-        resp = wikimedia.get(PROFILE_URL)
+        resp = wikimedia.get(PROFILE_URL, headers={'User-Agent': USER_AGENT})
         resp.raise_for_status()
         profile = resp.json()
         session['username'] = profile.get('username')

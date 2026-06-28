@@ -3,6 +3,8 @@ import json
 import re
 import time
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 from flask import Flask, render_template_string, jsonify, request, redirect, session, url_for, flash, Blueprint
 import requests
@@ -41,9 +43,21 @@ USER_AGENT = "WLEAuditor/1.0 (ztools on Toolforge)"
 HOME_DIR = os.environ.get("HOME", ".")
 EVENTS_FILE = os.path.join(HOME_DIR, "events.json")
 JSON_FILE = os.path.join(HOME_DIR, "removal_audit_log.json")
+LOG_FILE = os.path.join(HOME_DIR, "app.log")
 
 # The single owner account — only this user can manage roles
 OWNER_USERNAME = "R1F4T"
+# ---------------------
+
+# --- LOGGING SETUP ---
+log_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+log_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+logger = logging.getLogger('wle_auditor')
+logger.setLevel(logging.INFO)
+logger.addHandler(log_handler)
+# Also mirror to stdout so webservice logs picks it up
+logger.addHandler(logging.StreamHandler())
+logger.info("=== Application starting up ===")
 # ---------------------
 
 lock = threading.Lock()
@@ -191,7 +205,7 @@ def listen_to_stream():
     retry_delay = 5
     while True:
         try:
-            print(f"[stream] Connecting to EventStream...", flush=True)
+            logger.info("[stream] Connecting to EventStream...")
             with requests.get(
                 url, stream=True,
                 headers={'User-Agent': USER_AGENT, 'Accept': 'text/event-stream'},
@@ -199,7 +213,7 @@ def listen_to_stream():
             ) as response:
                 response.raise_for_status()
                 retry_delay = 5  # reset on successful connect
-                print(f"[stream] Connected. Listening...", flush=True)
+                logger.info("[stream] Connected. Listening...")
                 for line in response.iter_lines():
                     if line:
                         decoded_line = line.decode('utf-8')
@@ -240,9 +254,9 @@ def listen_to_stream():
                                 })
                                 seen_events.add(key)
                                 save_events()
-                                print(f"[stream] Saved: {user} removed {file_name} from {title}", flush=True)
+                                logger.info(f"[stream] SAVED: {user} removed '{file_name}' from '{title}'")
         except Exception as e:
-            print(f"[stream] Error: {e}. Reconnecting in {retry_delay}s...", flush=True)
+            logger.error(f"[stream] Error: {e}. Reconnecting in {retry_delay}s...")
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)  # exponential backoff, max 60s
 
@@ -504,7 +518,9 @@ def manage_roles():
 
 @auditor_bp.route('/api/update', methods=['POST'])
 def update_now():
+    logger.info(f"[catchup] Manual force-update triggered by {session.get('username', 'anonymous')}")
     added = catchup_missed_events()
+    logger.info(f"[catchup] Found {added} new events.")
     return jsonify({"status": "success", "new_events": added})
 
 
@@ -538,6 +554,54 @@ def user_suggest():
         return jsonify(users)
     except Exception as e:
         return jsonify([])
+
+
+@auditor_bp.route('/admin/logs')
+@owner_required
+def view_logs():
+    """Serve the last 200 lines of app.log in the browser (owner only)."""
+    lines = []
+    try:
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = ['Log file not found yet.']
+    last_lines = lines[-200:]
+    log_html = ''.join(last_lines).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>App Log Viewer</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="15">
+        <style>
+            body { background: #1a1a2e; color: #e0e0e0; font-family: 'Courier New', monospace; margin: 0; padding: 20px; }
+            h2 { color: #a29bfe; margin-bottom: 4px; }
+            .meta { color: #888; font-size: 0.85em; margin-bottom: 16px; }
+            pre { background: #16213e; padding: 20px; border-radius: 8px; overflow-x: auto;
+                  font-size: 0.85em; line-height: 1.6; white-space: pre-wrap; word-break: break-all;
+                  border: 1px solid #0f3460; max-height: 80vh; overflow-y: auto; }
+            .saved { color: #55efc4; }
+            .error { color: #ff7675; }
+            .info { color: #74b9ff; }
+            a { color: #a29bfe; text-decoration: none; font-family: sans-serif; font-size: 0.9em; }
+            a:hover { text-decoration: underline; }
+        </style>
+    </head>
+    <body>
+        <h2>📋 App Log — Last 200 lines</h2>
+        <p class="meta">Auto-refreshes every 15 seconds &nbsp;|&nbsp; File: {{ log_file }} &nbsp;|&nbsp;
+        <a href="{{ url_for('auditor.admin') }}">← Admin</a></p>
+        <pre id="log">{{ log_content }}</pre>
+        <script>
+            // Scroll to bottom on load
+            const pre = document.getElementById('log');
+            pre.scrollTop = pre.scrollHeight;
+        </script>
+    </body>
+    </html>
+    """, log_content=log_html, log_file=LOG_FILE)
 
 
 # --- TEMPLATES ---
@@ -695,6 +759,7 @@ ADMIN_TEMPLATE = """
         <div style="background:#fff8e1; border:1px solid #ffe082; padding:10px 14px; border-radius:6px; margin-bottom:20px; font-size:0.92em;">
             🔑 <strong>Owner Controls:</strong>
             <a href="{{ url_for('auditor.manage_roles') }}" style="margin-left:10px;">Manage Event Managers &rarr;</a>
+            <a href="{{ url_for('auditor.view_logs') }}" style="margin-left:16px;">📋 View App Log &rarr;</a>
         </div>
         {% endif %}
 

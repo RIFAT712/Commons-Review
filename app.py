@@ -292,15 +292,20 @@ def listen_to_stream():
                         with lock:
                             key = (timestamp, file_name)
                             if key not in seen_events:
-                                events.append({
+                                new_event = {
                                     "timestamp": timestamp,
                                     "user": user,
                                     "file_title": file_name,
                                     "category": title,
                                     "full_comment": comment
-                                })
+                                }
+                                events.append(new_event)
                                 seen_events.add(key)
-                                save_category_events(title)
+                                # Read fresh from disk → append → write back
+                                # This prevents data loss if in-memory list is stale
+                                cat_events = load_event_data(title)
+                                cat_events.append(new_event)
+                                save_event_data(title, cat_events)
                                 logger.info(f"[stream] SAVED: {user} removed '{file_name}' from '{title}'")
         except Exception as e:
             logger.error(f"[stream] Error: {e}. Reconnecting in {retry_delay}s...")

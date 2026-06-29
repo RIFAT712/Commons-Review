@@ -420,7 +420,7 @@ def login():
     return redirect(authorization_url)
 
 
-@app.route('/auth/callback')
+@auditor_bp.route('/auth/callback')
 def callback():
     wikimedia = OAuth2Session(CLIENT_ID, state=session.get(
         'oauth_state'), redirect_uri=url_for('callback', _external=True))
@@ -632,8 +632,9 @@ def update_now():
 
 @auditor_bp.route('/api/log')
 def get_log():
+    limit = request.args.get('limit', default=1000, type=int)
     with lock:
-        return jsonify(events)
+        return jsonify(events[-limit:])
 
 
 @auditor_bp.route('/api/events/<event_id>')
@@ -820,13 +821,16 @@ INDEX_TEMPLATE = """
             btn.disabled = true;
             btn.innerText = 'Updating...';
             fetch('{{ url_for("auditor.update_now") }}', { method: 'POST' })
-            .then(res => res.json())
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                return res.json();
+            })
             .then(data => {
                 alert('Found ' + data.new_events + ' new removals!');
                 window.location.reload();
             })
             .catch(err => {
-                alert('Update failed: ' + err);
+                alert('Update failed: ' + err.message);
                 btn.disabled = false;
                 btn.innerText = 'Force Update API';
             });

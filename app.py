@@ -4,6 +4,7 @@ import re
 import time
 import threading
 import logging
+from functools import wraps
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 from flask import Flask, render_template_string, jsonify, request, redirect, session, url_for, flash, Blueprint
@@ -62,6 +63,27 @@ logger.info("=== Application starting up ===")
 
 lock = threading.Lock()
 
+# --- CONFIG CACHE (avoids disk read on every stream event) ---
+_config_cache = None
+_config_cache_time = 0
+_CONFIG_CACHE_TTL = 60  # seconds
+
+
+def get_events_config_cached():
+    """Return config from memory, refreshing from disk at most every 60 seconds."""
+    global _config_cache, _config_cache_time
+    now = time.time()
+    if _config_cache is None or (now - _config_cache_time) > _CONFIG_CACHE_TTL:
+        _config_cache = get_events_config()
+        _config_cache_time = now
+    return _config_cache
+
+
+def invalidate_config_cache():
+    """Call this after any write to events.json so the cache refreshes immediately."""
+    global _config_cache
+    _config_cache = None
+
 
 def get_events_config():
     if not os.path.exists(EVENTS_FILE):
@@ -86,6 +108,7 @@ def get_events_config():
 def save_events_config(config):
     with open(EVENTS_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4)
+    invalidate_config_cache()  # force fresh read on next access
 
 
 def get_event_file(category):
@@ -188,7 +211,7 @@ def catchup_missed_events():
     config = get_events_config()
     with requests.Session() as session_req:
         for category in config["ongoing"]:
-            cat_new = 0
+            new_events_for_cat = []
             rccontinue = None
             while True:
                 params = {
@@ -227,7 +250,7 @@ def catchup_missed_events():
                                         }
                                         events.append(row)
                                         seen_events.add((timestamp, file_name))
-                                        cat_new += 1
+                                        new_events_for_cat.append(row)
                                         new_rows += 1
 
                     if "continue" in data and "rccontinue" in data["continue"]:
@@ -238,10 +261,16 @@ def catchup_missed_events():
                     logger.error(f"[catchup] Error for '{category}': {e}")
                     break
 
-            if cat_new > 0:
+            if new_events_for_cat:
                 with lock:
-                    save_category_events(category)
-                logger.info(f"[catchup] Saved {cat_new} new rows to event_{get_category_id(category)}.json")
+                    # Read fresh from disk → merge → write back (safe, no stale overwrite)
+                    existing = load_event_data(category)
+                    existing_keys = {(r.get('timestamp'), r.get('file_title')) for r in existing}
+                    truly_new = [r for r in new_events_for_cat
+                                 if (r['timestamp'], r['file_title']) not in existing_keys]
+                    if truly_new:
+                        save_event_data(category, existing + truly_new)
+                        logger.info(f"[catchup] Saved {len(truly_new)} new rows to event_{get_category_id(category)}.json")
 
     return new_rows
 
@@ -275,7 +304,8 @@ def listen_to_stream():
                             continue
 
                         title = data.get('title', '')
-                        current_categories = get_events_config().get("ongoing", [])
+                        # Use cached config — avoids a disk read on every stream event
+                        current_categories = get_events_config_cached().get("ongoing", [])
                         if title not in current_categories:
                             continue
 
@@ -428,8 +458,6 @@ def logout():
 
 
 def login_required(f):
-    from functools import wraps
-
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'username' not in session:
@@ -439,8 +467,6 @@ def login_required(f):
 
 
 def manager_required(f):
-    from functools import wraps
-
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'username' not in session:
@@ -453,8 +479,6 @@ def manager_required(f):
 
 
 def owner_required(f):
-    from functools import wraps
-
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'username' not in session:
@@ -480,6 +504,13 @@ def admin():
                 if category not in config.get('event_details', {}):
                     config.setdefault('event_details', {})[category] = {"tracked_users": []}
                 save_events_config(config)
+                # Fix #5: reload seen_events so new category is tracked immediately
+                with lock:
+                    for row in load_event_data(category):
+                        key = (row.get('timestamp'), row.get('file_title'))
+                        if key not in seen_events:
+                            seen_events.add(key)
+                            events.append(row)
                 flash(f"Added '{category}' to ongoing events.", "success")
             else:
                 flash("Event already exists.", "error")
@@ -603,6 +634,30 @@ def update_now():
 def get_log():
     with lock:
         return jsonify(events)
+
+
+@auditor_bp.route('/api/events/<event_id>')
+def get_event_data(event_id):
+    """Return events for a single category by its event_id hash."""
+    config = get_events_config()
+    target_category = None
+    for cat in config.get('ongoing', []) + config.get('archived', []):
+        if get_category_id(cat) == event_id:
+            target_category = cat
+            break
+    if not target_category:
+        return jsonify({"error": "Event not found"}), 404
+    return jsonify(load_event_data(target_category))
+
+
+@app.route('/health')
+def health():
+    """Health check endpoint — useful for Toolforge monitoring."""
+    return jsonify({
+        "status": "ok",
+        "stream_alive": stream_thread.is_alive(),
+        "events_loaded": len(events),
+    })
 
 
 @auditor_bp.route('/api/user-suggest')

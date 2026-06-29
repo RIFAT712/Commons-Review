@@ -256,7 +256,7 @@ def listen_to_stream():
             with requests.get(
                 url, stream=True,
                 headers={'User-Agent': USER_AGENT, 'Accept': 'text/event-stream'},
-                timeout=60
+                timeout=(10, 300)  # 10s connect timeout, 5min read timeout
             ) as response:
                 response.raise_for_status()
                 retry_delay = 5  # reset on successful connect
@@ -311,6 +311,14 @@ def listen_to_stream():
             logger.error(f"[stream] Error: {e}. Reconnecting in {retry_delay}s...")
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)  # exponential backoff, max 60s
+            # Catch up on any events missed during the disconnect gap
+            logger.info("[stream] Running catchup for events missed during disconnect...")
+            try:
+                missed = catchup_missed_events()
+                if missed:
+                    logger.info(f"[stream] Catchup found {missed} missed event(s).")
+            except Exception as ce:
+                logger.error(f"[stream] Catchup failed: {ce}")
 
 
 stream_thread = threading.Thread(target=listen_to_stream, daemon=True)

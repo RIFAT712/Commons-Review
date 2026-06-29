@@ -300,7 +300,7 @@ def listen_to_stream():
                                     "full_comment": comment
                                 })
                                 seen_events.add(key)
-                                save_events()
+                                save_category_events(title)
                                 logger.info(f"[stream] SAVED: {user} removed '{file_name}' from '{title}'")
         except Exception as e:
             logger.error(f"[stream] Error: {e}. Reconnecting in {retry_delay}s...")
